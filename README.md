@@ -1,2 +1,2 @@
-# ArchAnalyzer4AUTOSAR
+# ArchVisualizer4AUTOSAR
 AUTOSAR Component Architecture Visualizer
