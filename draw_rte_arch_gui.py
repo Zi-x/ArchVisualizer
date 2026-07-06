@@ -12,14 +12,23 @@ class RTEAnalyzer:
         self.src_root = ""
         self.puml_out = "./rte_architecture.puml"
         self.target_modules = []
-        self.filter_by_target_module = True
+        self.display_mode = "related"  # "all": 显示所有, "only": 仅目标模块, "related": 目标+关联模块
         self.merge_multi_signal = True
         self.only_alphabet_module = True
+        # 最终边集
         self.edge_signals = defaultdict(set)
         self.all_components = set()
+        # 正则表达式
         self.pat_read = re.compile(
-            r'#\s*define\s+Rte_Read_([a-zA-Z0-9_]+)_([a-zA-Z0-9_]+_\w+)\(data\)\s*\(\*\(data\)\s*=\s*Rte_([a-zA-Z0-9_]+)_([a-zA-Z0-9_]+_\w+)\s*,\s*\(\(Std_ReturnType\)RTE_E_OK\)\s*\)'
+            r'#\s*define\s+Rte_Read_([a-zA-Z0-9]+)_([a-zA-Z0-9_]+)\(data\)\s*\(\s*\*\(data\)\s*=\s*Rte_([a-zA-Z0-9]+)_([a-zA-Z0-9_]+)\s*,\s*\(\(Std_ReturnType\)RTE_E_OK\)\s*\)'
         )
+        self.pat_write = re.compile(
+            r'#\s*define\s+Rte_Write_[a-zA-Z0-9]+_[a-zA-Z0-9_]+\(data\)\s*\(\s*Rte_([a-zA-Z0-9]+)_([a-zA-Z0-9_]+)\s*=\s*\(data\)\s*,\s*\(\(Std_ReturnType\)RTE_E_OK\)\s*\)'
+        )
+        # 数据结构
+        self.write_map = defaultdict(set)
+        self.signal_to_writers = defaultdict(set)
+        self.signal_to_readers = defaultdict(set)
 
     def is_file_need_skip(self, filename: str) -> bool:
         if filename.startswith("Rte_") and filename.endswith(".h"):
@@ -38,47 +47,47 @@ class RTEAnalyzer:
             return True
         return mod_name in self.target_modules
 
-    def is_edge_keep(self, sender: str, receiver: str) -> bool:
-        if not self.filter_by_target_module or len(self.target_modules) == 0:
-            return True
-        return (sender in self.target_modules) and (receiver in self.target_modules)
-
     def scan_header_file(self, filepath: str, filename: str):
         current_mod = self.get_module_from_filename(filename)
         if self.only_alphabet_module and not self.is_module_name_only_alphabet(current_mod):
             return
-        if not self.is_file_module_allowed(current_mod):
-            return
         try:
             with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
-                    m = self.pat_read.search(line.strip())
+                    line = line.strip()
+                    # 匹配 Rte_Read
+                    m = self.pat_read.search(line)
                     if m:
                         recv_comp, sig, send_comp, sig2 = m.groups()
                         if sig != sig2:
                             continue
-                        if send_comp == recv_comp:
-                            continue
-                        if not self.is_edge_keep(send_comp, recv_comp):
-                            continue
-                        self.edge_signals[(send_comp, recv_comp)].add(sig)
-                        self.all_components.add(send_comp)
-                        self.all_components.add(recv_comp)
+                        self.signal_to_readers[sig].add(current_mod)
+                        continue
+                    # 匹配 Rte_Write
+                    mw = self.pat_write.search(line)
+                    if mw:
+                        mod, sig = mw.groups()
+                        self.signal_to_writers[sig].add(mod)
+                        self.write_map[mod].add(sig)
         except Exception as e:
             print(f"跳过异常文件 {filepath}: {e}")
 
     def traverse_dir(self, root: str, callback=None):
+        # 重置数据结构
         self.edge_signals.clear()
         self.all_components.clear()
-        parse_cnt = skip_type = skip_alpha = skip_filter = 0
+        self.write_map.clear()
+        self.signal_to_writers.clear()
+        self.signal_to_readers.clear()
+
+        parse_cnt = skip_type = skip_alpha = 0
         total_files = 0
-        
-        # 先统计总数
+        # 统计总数
         for _, _, filenames in os.walk(root):
             for fname in filenames:
                 if fname.startswith("Rte_") and fname.endswith(".h") and not self.is_file_need_skip(fname):
                     total_files += 1
-        
+
         processed = 0
         for dirpath, _, filenames in os.walk(root):
             for fname in filenames:
@@ -90,15 +99,99 @@ class RTEAnalyzer:
                     if self.only_alphabet_module and not self.is_module_name_only_alphabet(mod):
                         skip_alpha += 1
                         continue
-                    if not self.is_file_module_allowed(mod):
-                        skip_filter += 1
-                        continue
                     self.scan_header_file(os.path.join(dirpath, fname), fname)
                     parse_cnt += 1
                     processed += 1
                     if callback:
                         callback(processed, total_files)
-        return parse_cnt, skip_type, skip_alpha, skip_filter
+        return parse_cnt, skip_type, skip_alpha
+
+    def build_edges(self):
+        """根据收集的信号关系构建最终边集（双向确认）"""
+        self.edge_signals.clear()
+        self.all_components.clear()
+        
+        temp_edges = defaultdict(set)
+        
+        # 情况1: 显示所有模块
+        if self.display_mode == "all":
+            for sig, writers in self.signal_to_writers.items():
+                readers = self.signal_to_readers.get(sig, set())
+                for writer in writers:
+                    for reader in readers:
+                        if writer == reader:
+                            continue
+                        temp_edges[(writer, reader)].add(sig)
+                        self.all_components.add(writer)
+                        self.all_components.add(reader)
+            
+            for sig, readers in self.signal_to_readers.items():
+                writers = self.signal_to_writers.get(sig, set())
+                for reader in readers:
+                    for writer in writers:
+                        if writer == reader:
+                            continue
+                        temp_edges[(writer, reader)].add(sig)
+                        self.all_components.add(writer)
+                        self.all_components.add(reader)
+        
+        # 情况2: 仅显示目标模块
+        elif self.display_mode == "only":
+            if not self.target_modules:
+                # 如果没有目标模块，显示所有
+                for sig, writers in self.signal_to_writers.items():
+                    readers = self.signal_to_readers.get(sig, set())
+                    for writer in writers:
+                        for reader in readers:
+                            if writer == reader:
+                                continue
+                            temp_edges[(writer, reader)].add(sig)
+                            self.all_components.add(writer)
+                            self.all_components.add(reader)
+            else:
+                # 只保留目标模块之间的边
+                target_set = set(self.target_modules)
+                for sig, writers in self.signal_to_writers.items():
+                    readers = self.signal_to_readers.get(sig, set())
+                    for writer in writers:
+                        for reader in readers:
+                            if writer == reader:
+                                continue
+                            # 只有两端都在目标模块中才保留
+                            if writer in target_set and reader in target_set:
+                                temp_edges[(writer, reader)].add(sig)
+                                self.all_components.add(writer)
+                                self.all_components.add(reader)
+        
+        # 情况3: 显示目标模块及关联模块（默认）
+        else:  # "related"
+            if not self.target_modules:
+                # 如果没有目标模块，显示所有
+                for sig, writers in self.signal_to_writers.items():
+                    readers = self.signal_to_readers.get(sig, set())
+                    for writer in writers:
+                        for reader in readers:
+                            if writer == reader:
+                                continue
+                            temp_edges[(writer, reader)].add(sig)
+                            self.all_components.add(writer)
+                            self.all_components.add(reader)
+            else:
+                target_set = set(self.target_modules)
+                # 先收集所有与目标模块相关的边
+                for sig, writers in self.signal_to_writers.items():
+                    readers = self.signal_to_readers.get(sig, set())
+                    for writer in writers:
+                        for reader in readers:
+                            if writer == reader:
+                                continue
+                            # 只要有一端在目标模块中就保留
+                            if writer in target_set or reader in target_set:
+                                temp_edges[(writer, reader)].add(sig)
+                                self.all_components.add(writer)
+                                self.all_components.add(reader)
+        
+        self.edge_signals = temp_edges
 
     def generate_mermaid(self):
         lines = [
@@ -145,6 +238,7 @@ class RTEAnalyzer:
 
         nodes_json = json.dumps(nodes_data, ensure_ascii=False)
         edges_json = json.dumps(edges_data, ensure_ascii=False)
+        target_modules_json = json.dumps(self.target_modules, ensure_ascii=False)
 
         html = f'''<!DOCTYPE html>
 <html lang="zh-CN">
@@ -160,6 +254,52 @@ class RTEAnalyzer:
         .search-box {{ margin-bottom:15px; }}
         .search-box input {{ width:100%; padding:10px; border:2px solid #ddd; border-radius:8px; font-size:14px; transition:border-color 0.3s; }}
         .search-box input:focus {{ outline:none; border-color:#667eea; }}
+        
+        /* 小开关样式 */
+        .switch-container {{
+            display:flex;
+            align-items:center;
+            justify-content:space-between;
+            padding:8px 12px;
+            background:#f0f0f0;
+            border-radius:8px;
+            margin-bottom:12px;
+            font-size:12px;
+            color:#555;
+        }}
+        .switch-label {{
+            display:flex;
+            align-items:center;
+            gap:6px;
+        }}
+        .switch {{
+            position:relative;
+            width:40px;
+            height:22px;
+            background:#ccc;
+            border-radius:11px;
+            cursor:pointer;
+            transition:all 0.3s;
+            flex-shrink:0;
+        }}
+        .switch.active {{
+            background:#667eea;
+        }}
+        .switch .slider {{
+            position:absolute;
+            top:2px;
+            left:2px;
+            width:18px;
+            height:18px;
+            background:white;
+            border-radius:50%;
+            transition:all 0.3s;
+            box-shadow:0 1px 3px rgba(0,0,0,0.3);
+        }}
+        .switch.active .slider {{
+            left:20px;
+        }}
+        
         .node-list {{ flex:1; overflow-y:auto; margin-bottom:15px; }}
         .node-item {{ display:flex; align-items:center; justify-content:space-between; padding:10px; margin:5px 0; background:#f8f9fa; border-radius:8px; cursor:pointer; transition:all 0.3s; border:2px solid transparent; }}
         .node-item:hover {{ background:#e9ecef; transform:translateX(5px); }}
@@ -211,6 +351,13 @@ class RTEAnalyzer:
             <div class="search-box">
                 <input type="text" id="searchInput" placeholder="🔍 过滤模块..." onkeyup="filterNodes()">
             </div>
+            <div class="switch-container">
+                <span class="switch-label">🔗 显示关联</span>
+                <div class="switch active" id="modeSwitch" onclick="toggleMode()">
+                    <div class="slider"></div>
+                </div>
+                <span class="switch-label">📌 仅目标模块</span>
+            </div>
             <div class="statistics">
                 <div>📊 总模块数: <strong>{len(nodes_data)}</strong></div>
                 <div>🔗 总连接数: <strong>{len(edges_data)}</strong></div>
@@ -218,9 +365,10 @@ class RTEAnalyzer:
             <div class="node-list" id="nodeList"></div>
             <div class="legend">
                 <h3>📖 图例</h3>
-                <div class="legend-item"><div class="legend-color" style="background:#ffd700;border:2px solid #ff8c00;"></div><span>选中模块（黄色）</span></div>
-                <div class="legend-item"><div class="legend-color" style="background:#4caf50;"></div><span>关联模块（绿色填充）</span></div>
-                <div class="legend-item"><div class="legend-color" style="background:#ff8c00; width:20px; height:3px;"></div><span>高亮连线（未实现）</span></div>
+                <div class="legend-item"><div class="legend-color" style="background:#ffd700;border:2px solid #ff8c00;"></div><span>选中模块（金色）</span></div>
+                <div class="legend-item"><div class="legend-color" style="background:#4caf50;"></div><span>输入模块（绿色）</span></div>
+                <div class="legend-item"><div class="legend-color" style="background:#f44336;"></div><span>输出模块（红色）</span></div>
+                <div class="legend-item"><div class="legend-color" style="background:#9c27b0;"></div><span>双向模块（紫色）</span></div>
             </div>
         </div>
         <div class="main-content">
@@ -274,12 +422,14 @@ class RTEAnalyzer:
 
         const nodesData = {nodes_json};
         const edgesData = {edges_json};
+        const targetModules = {target_modules_json};
         let selectedNode = null;
         let currentZoom = 1;
         let isDragging = false;
         let startX = 0, startY = 0;
         let translateX = 0, translateY = 0;
         const ZOOM_STEP = 0.2, MIN_ZOOM = 0.2, MAX_ZOOM = 5;
+        let showOnlyTarget = true;  // true: 仅目标模块, false: 显示关联模块
 
         function generateNodeList() {{
             const nl = document.getElementById('nodeList');
@@ -297,6 +447,36 @@ class RTEAnalyzer:
                 `;
                 nl.appendChild(div);
             }});
+            
+            // 应用当前模式
+            applyMode(showOnlyTarget);
+        }}
+
+        function applyMode(onlyTarget) {{
+            const nodeItems = document.querySelectorAll('.node-item');
+            const searchInput = document.getElementById('searchInput');
+            const searchText = searchInput ? searchInput.value.toLowerCase() : '';
+            
+            if (onlyTarget && targetModules && targetModules.length > 0) {{
+                // 仅显示目标模块
+                nodeItems.forEach(item => {{
+                    const label = item.querySelector('strong').textContent;
+                    const shouldShow = targetModules.includes(label);
+                    item.style.display = shouldShow ? 'flex' : 'none';
+                }});
+            }} else {{
+                // 显示所有模块
+                nodeItems.forEach(item => {{
+                    item.style.display = 'flex';
+                }});
+                // 如果有搜索文本，应用搜索过滤
+                if (searchText) {{
+                    nodeItems.forEach(item => {{
+                        const text = item.textContent.toLowerCase();
+                        item.style.display = text.includes(searchText) ? 'flex' : 'none';
+                    }});
+                }}
+            }}
         }}
 
         function updateTransform() {{
@@ -387,49 +567,46 @@ class RTEAnalyzer:
             }});
         }}
 
-        function annotateEdges() {{
-            const svg = document.querySelector('.mermaid svg');
-            if (!svg) return;
-            const edgeGroups = svg.querySelectorAll('g.edge');
-            edgeGroups.forEach(g => {{
-                const text = g.textContent.trim().replace(/\\s+/g, ' ');
-                for (const edge of edgesData) {{
-                    if (text.includes(edge.label)) {{
-                        g.setAttribute('data-edge-id', edge.id);
-                        break;
-                    }}
-                }}
-            }});
-        }}
-
         function applyHighlightCSS(nodeId) {{
             const svg = document.querySelector('.mermaid svg');
             if (!svg) return;
 
-            const old = svg.getElementById('highlight-style');
+            const old = document.getElementById('highlight-style');
             if (old) old.remove();
 
             const relatedEdges = edgesData.filter(e => e.source === nodeId || e.target === nodeId);
-            const relatedEdgeIds = new Set(relatedEdges.map(e => e.id));
             const relatedNodeIds = new Set([nodeId]);
             relatedEdges.forEach(e => {{ relatedNodeIds.add(e.source); relatedNodeIds.add(e.target); }});
 
-            let css = '';
+            const incoming = new Set(relatedEdges.filter(e => e.target === nodeId).map(e => e.source));
+            const outgoing = new Set(relatedEdges.filter(e => e.source === nodeId).map(e => e.target));
 
+            let css = '';
+            // 1. 选中节点本身：金色
             css += `g.node[data-node-id="${{nodeId}}"] rect, g.node[data-node-id="${{nodeId}}"] circle, g.node[data-node-id="${{nodeId}}"] polygon {{ fill: #ffd700 !important; stroke: #ff8c00 !important; stroke-width: 3px !important; }}`;
             css += `g.node[data-node-id="${{nodeId}}"] text {{ fill: #000 !important; font-weight: bold; }}`;
 
-            const relatedOthers = Array.from(relatedNodeIds).filter(id => id !== nodeId);
-            relatedOthers.forEach(id => {{
-                css += `g.node[data-node-id="${{id}}"] rect, g.node[data-node-id="${{id}}"] circle, g.node[data-node-id="${{id}}"] polygon {{ fill: #4caf50 !important; stroke: #388e3c !important; stroke-width: 2px !important; }}`;
-                css += `g.node[data-node-id="${{id}}"] text {{ fill: #fff !important; font-weight: bold; }}`;
+            // 2. 相关节点（排除自身）
+            relatedNodeIds.forEach(id => {{
+                if (id === nodeId) return;
+                const isIn = incoming.has(id);
+                const isOut = outgoing.has(id);
+                let color = '', darkColor = '';
+                if (isIn && isOut) {{
+                    color = '#9c27b0';   // 紫色
+                    darkColor = '#6a1b9a';
+                }} else if (isIn) {{
+                    color = '#4caf50';   // 绿色
+                    darkColor = '#2e7d32';
+                }} else if (isOut) {{
+                    color = '#f44336';   // 红色
+                    darkColor = '#c62828';
+                }}
+                if (color) {{
+                    css += `g.node[data-node-id="${{id}}"] rect, g.node[data-node-id="${{id}}"] circle, g.node[data-node-id="${{id}}"] polygon {{ fill: ${{color}} !important; stroke: ${{darkColor}} !important; stroke-width: 2px !important; }}`;
+                    css += `g.node[data-node-id="${{id}}"] text {{ fill: #fff !important; font-weight: bold; }}`;
+                }}
             }});
-
-            if (relatedEdgeIds.size) {{
-                const edgeSel = Array.from(relatedEdgeIds).map(id => `g.edge[data-edge-id="${{id}}"]`).join(', ');
-                css += `${{edgeSel}} path {{ stroke: #ff8c00 !important; stroke-width: 2px !important; }}`;
-                css += `${{edgeSel}} text, ${{edgeSel}} .edgeLabel {{ fill: #ff8c00 !important; font-weight: bold !important; }}`;
-            }}
 
             const styleEl = document.createElementNS('http://www.w3.org/2000/svg', 'style');
             styleEl.id = 'highlight-style';
@@ -493,16 +670,56 @@ class RTEAnalyzer:
             }}
             document.getElementById('infoPanel').classList.remove('show');
             document.getElementById('searchInput').value = '';
-            window.filterNodes();
+            // 重置搜索后重新应用模式
+            applyMode(showOnlyTarget);
         }};
 
         window.filterNodes = function() {{
             const s = document.getElementById('searchInput').value.toLowerCase();
-            document.querySelectorAll('.node-item').forEach(i => {{
-                const text = i.textContent.toLowerCase();
-                i.style.display = text.includes(s) ? 'flex' : 'none';
+            const nodeItems = document.querySelectorAll('.node-item');
+            
+            // 先应用模式过滤，再应用搜索过滤
+            nodeItems.forEach(item => {{
+                const label = item.querySelector('strong').textContent;
+                let shouldShow = true;
+                
+                // 如果是"仅目标模块"模式，先检查是否为目标模块
+                if (showOnlyTarget && targetModules && targetModules.length > 0) {{
+                    if (!targetModules.includes(label)) {{
+                        shouldShow = false;
+                    }}
+                }}
+                
+                // 如果通过了模式过滤，再检查搜索文本
+                if (shouldShow && s) {{
+                    const text = item.textContent.toLowerCase();
+                    shouldShow = text.includes(s);
+                }}
+                
+                item.style.display = shouldShow ? 'flex' : 'none';
             }});
         }};
+
+        // ===== 模式切换功能 =====
+        window.toggleMode = function() {{
+            const switchEl = document.getElementById('modeSwitch');
+            showOnlyTarget = !showOnlyTarget;
+            switchEl.classList.toggle('active');
+            
+            console.log('切换模式:', showOnlyTarget ? '仅目标模块' : '显示关联');
+            console.log('目标模块列表:', targetModules);
+            
+            // 清空搜索框
+            document.getElementById('searchInput').value = '';
+            
+            // 应用模式
+            applyMode(showOnlyTarget);
+            
+            // 重置高亮
+            window.resetHighlight();
+            setTimeout(window.zoomFit, 100);
+        }};
+        // =========================
 
         document.addEventListener('keydown', e => {{
             if (e.key === 'Escape') {{
@@ -567,12 +784,16 @@ class RTEAnalyzer:
         }};
 
         function onMermaidReady() {{
+            console.log('Mermaid渲染完成，开始初始化...');
+            console.log('目标模块:', targetModules);
             generateNodeList();
             initDrag();
             initWheelZoom();
-            annotateNodes();
-            annotateEdges();
-            setTimeout(window.zoomFit, 200);
+            
+            setTimeout(() => {{
+                annotateNodes();
+                window.zoomFit();
+            }}, 100);
         }}
 
         window.addEventListener('resize', () => {{ if (currentZoom===1 && translateX===0 && translateY===0) window.zoomFit(); }});
@@ -597,7 +818,7 @@ class ConfigManager:
             'src_root': config_data.get('src_root', ''),
             'puml_out': config_data.get('puml_out', './rte_architecture.puml'),
             'target_modules': ','.join(config_data.get('target_modules', [])),
-            'filter_by_target_module': str(config_data.get('filter_by_target_module', True)),
+            'display_mode': config_data.get('display_mode', 'related'),
             'merge_multi_signal': str(config_data.get('merge_multi_signal', True)),
             'only_alphabet_module': str(config_data.get('only_alphabet_module', True))
         }
@@ -618,7 +839,7 @@ class ConfigManager:
                 'src_root': settings.get('src_root', ''),
                 'puml_out': settings.get('puml_out', './rte_architecture.puml'),
                 'target_modules': [m.strip() for m in settings.get('target_modules', '').split(',') if m.strip()],
-                'filter_by_target_module': settings.getboolean('filter_by_target_module', True),
+                'display_mode': settings.get('display_mode', 'related'),
                 'merge_multi_signal': settings.getboolean('merge_multi_signal', True),
                 'only_alphabet_module': settings.getboolean('only_alphabet_module', True)
             }
@@ -634,33 +855,23 @@ class RTEAnalyzerGUI:
         self.root.geometry("900x700")
         self.root.minsize(800, 600)
         
-        # 分析器实例
         self.analyzer = RTEAnalyzer()
-        
-        # 加载保存的配置
         self.loaded_config = ConfigManager.load_config()
         
-        # 创建界面
         self.create_widgets()
-        
-        # 加载配置到界面
         if self.loaded_config:
             self.apply_config_to_ui(self.loaded_config)
     
     def create_widgets(self):
-        # 主容器
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # ===== 标题 =====
         title_label = ttk.Label(main_frame, text="AUTOSAR 组件架构分析工具", font=("Arial", 16, "bold"))
         title_label.pack(pady=(0, 15))
         
-        # ===== 配置区域 =====
         config_frame = ttk.LabelFrame(main_frame, text="⚙️ 配置参数", padding="10")
         config_frame.pack(fill=tk.X, pady=(0, 10))
         
-        # 第一行：输入文件（原组件文件夹）
         row1 = ttk.Frame(config_frame)
         row1.pack(fill=tk.X, pady=2)
         ttk.Label(row1, text="📁 输入文件:", width=15).pack(side=tk.LEFT)
@@ -669,7 +880,6 @@ class RTEAnalyzerGUI:
         self.src_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         ttk.Button(row1, text="浏览...", command=self.browse_src_folder).pack(side=tk.RIGHT)
         
-        # 第二行：输出文件
         row2 = ttk.Frame(config_frame)
         row2.pack(fill=tk.X, pady=2)
         ttk.Label(row2, text="📄 输出文件:", width=15).pack(side=tk.LEFT)
@@ -678,7 +888,6 @@ class RTEAnalyzerGUI:
         self.puml_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         ttk.Button(row2, text="浏览...", command=self.browse_output_file).pack(side=tk.RIGHT)
         
-        # 第三行：目标模块（支持手动输入和导入）
         row3 = ttk.Frame(config_frame)
         row3.pack(fill=tk.X, pady=2)
         ttk.Label(row3, text="🎯 目标模块:", width=15).pack(side=tk.LEFT)
@@ -687,28 +896,34 @@ class RTEAnalyzerGUI:
         self.modules_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         ttk.Button(row3, text="📂 导入", command=self.import_module_list).pack(side=tk.RIGHT)
         
-        # 提示标签
         hint_label = ttk.Label(config_frame, text="💡 目标模块用英文逗号(,)分隔", foreground="gray", font=("Arial", 8))
         hint_label.pack(anchor=tk.W, pady=(2, 0))
         
-        # 复选框行
         checkbox_frame = ttk.Frame(config_frame)
         checkbox_frame.pack(fill=tk.X, pady=(5, 0))
         
-        self.filter_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(checkbox_frame, text="按目标模块过滤", variable=self.filter_var).pack(side=tk.LEFT, padx=(0, 15))
+        # 显示模式选择
+        mode_frame = ttk.Frame(checkbox_frame)
+        mode_frame.pack(anchor=tk.W, pady=(0, 5))
+        ttk.Label(mode_frame, text="📊 显示模式:").pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.display_mode_var = tk.StringVar(value="related")
+        ttk.Radiobutton(mode_frame, text="所有模块", variable=self.display_mode_var, 
+                       value="all").pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Radiobutton(mode_frame, text="仅目标模块", variable=self.display_mode_var, 
+                       value="only").pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Radiobutton(mode_frame, text="目标+关联模块", variable=self.display_mode_var, 
+                       value="related").pack(side=tk.LEFT)
         
         self.merge_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(checkbox_frame, text="合并多信号", variable=self.merge_var).pack(side=tk.LEFT, padx=(0, 15))
         
         self.alphabet_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(checkbox_frame, text="仅分析字母模块名", variable=self.alphabet_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(checkbox_frame, text="仅分析纯字母模块的文件", variable=self.alphabet_var).pack(side=tk.LEFT)
         
-        # ===== 进度和日志区域 =====
         status_frame = ttk.LabelFrame(main_frame, text="📊 状态", padding="10")
         status_frame.pack(fill=tk.X, pady=(0, 10))
         
-        # 进度条
         progress_bar_frame = ttk.Frame(status_frame)
         progress_bar_frame.pack(fill=tk.X, pady=(0, 5))
         ttk.Label(progress_bar_frame, text="进度:").pack(side=tk.LEFT)
@@ -718,11 +933,9 @@ class RTEAnalyzerGUI:
         self.progress_label = ttk.Label(progress_bar_frame, text="0%")
         self.progress_label.pack(side=tk.RIGHT, padx=(5, 0))
         
-        # 状态标签
         self.status_label = ttk.Label(status_frame, text="就绪", foreground="gray")
         self.status_label.pack(anchor=tk.W)
         
-        # ===== 按钮区域 =====
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X, pady=(0, 10))
         
@@ -731,18 +944,15 @@ class RTEAnalyzerGUI:
         ttk.Button(button_frame, text="📂 打开结果文件夹", command=self.open_output_folder).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(button_frame, text="🌐 打开HTML", command=self.open_html).pack(side=tk.LEFT)
         
-        # ===== 日志区域 =====
         log_frame = ttk.LabelFrame(main_frame, text="📋 日志", padding="5")
         log_frame.pack(fill=tk.BOTH, expand=True)
         
         self.log_text = tk.Text(log_frame, height=12, wrap=tk.WORD, font=("Consolas", 9))
         scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=scrollbar.set)
-        
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # 配置样式
         style = ttk.Style()
         style.configure("Accent.TButton", font=("Arial", 10, "bold"))
     
@@ -771,10 +981,8 @@ class RTEAnalyzerGUI:
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
-                # 尝试解析为逗号/空格/换行分隔的列表
                 modules = re.split(r'[,\s\n]+', content)
                 modules = [m.strip() for m in modules if m.strip()]
-                # 填入输入框，用逗号分隔
                 self.modules_var.set(', '.join(modules))
                 self.log(f"已导入 {len(modules)} 个模块: {', '.join(modules[:5])}{'...' if len(modules) > 5 else ''}")
             except Exception as e:
@@ -787,8 +995,8 @@ class RTEAnalyzerGUI:
             self.puml_out_var.set(config['puml_out'])
         if config.get('target_modules'):
             self.modules_var.set(', '.join(config['target_modules']))
-        if 'filter_by_target_module' in config:
-            self.filter_var.set(config['filter_by_target_module'])
+        if 'display_mode' in config:
+            self.display_mode_var.set(config['display_mode'])
         if 'merge_multi_signal' in config:
             self.merge_var.set(config['merge_multi_signal'])
         if 'only_alphabet_module' in config:
@@ -797,14 +1005,13 @@ class RTEAnalyzerGUI:
     
     def get_config_from_ui(self):
         modules_text = self.modules_var.get().strip()
-        # 支持逗号、中文逗号、空格分隔
         modules_text = modules_text.replace('，', ',')
         target_modules = [m.strip() for m in modules_text.split(',') if m.strip()]
         return {
             'src_root': self.src_root_var.get().strip(),
             'puml_out': self.puml_out_var.get().strip() or './rte_architecture.puml',
             'target_modules': target_modules,
-            'filter_by_target_module': self.filter_var.get(),
+            'display_mode': self.display_mode_var.get(),
             'merge_multi_signal': self.merge_var.get(),
             'only_alphabet_module': self.alphabet_var.get()
         }
@@ -833,7 +1040,6 @@ class RTEAnalyzerGUI:
     def start_analysis(self):
         config = self.get_config_from_ui()
         
-        # 验证
         if not config['src_root']:
             messagebox.showwarning("警告", "请先选择组件文件夹")
             return
@@ -841,11 +1047,10 @@ class RTEAnalyzerGUI:
             messagebox.showerror("错误", "组件文件夹不存在!")
             return
         
-        # 更新分析器配置
         self.analyzer.src_root = config['src_root']
         self.analyzer.puml_out = config['puml_out']
         self.analyzer.target_modules = config['target_modules']
-        self.analyzer.filter_by_target_module = config['filter_by_target_module']
+        self.analyzer.display_mode = config['display_mode']
         self.analyzer.merge_multi_signal = config['merge_multi_signal']
         self.analyzer.only_alphabet_module = config['only_alphabet_module']
         
@@ -853,29 +1058,47 @@ class RTEAnalyzerGUI:
         self.log(f"📁 组件目录: {config['src_root']}")
         self.log(f"📄 输出文件: {config['puml_out']}")
         self.log(f"🎯 目标模块: {len(config['target_modules'])} 个")
+        
+        mode_names = {
+            "all": "显示所有模块",
+            "only": "仅显示目标模块",
+            "related": "显示目标模块及关联模块"
+        }
+        self.log(f"📊 显示模式: {mode_names.get(config['display_mode'], '目标+关联模块')}")
         self.log("-" * 50)
         self.log("开始扫描...")
         
-        # 禁用按钮
         self.root.config(cursor="watch")
         
         try:
-            # 执行分析
-            parse_cnt, skip_type, skip_alpha, skip_filter = self.analyzer.traverse_dir(
+            parse_cnt, skip_type, skip_alpha = self.analyzer.traverse_dir(
                 config['src_root'],
                 self.update_progress
             )
+            self.log(f"📊 扫描完成: 解析 {parse_cnt} 个文件, 跳过Type {skip_type}, 非字母 {skip_alpha}")
             
-            self.log(f"📊 扫描完成: 解析 {parse_cnt} 个文件, 跳过Type {skip_type}, 非字母 {skip_alpha}, 过滤 {skip_filter}")
+            # 构建边集
+            self.analyzer.build_edges()
+            edge_count = len(self.analyzer.edge_signals)
+            self.log(f"🔗 生成 {edge_count} 条连接")
             
-            if not self.analyzer.edge_signals:
+            # 检查连线数量限制
+            if edge_count > 1000:
+                self.log("⚠️ 连线数量超过 1000 条，停止生成结果")
+                messagebox.showwarning("连线数量超限", 
+                    f"检测到 {edge_count} 条连线，超过 1000 条限制。\n"
+                    "请使用目标模块过滤或缩小分析范围。")
+                self.status_label.config(text="连线过多，未生成", foreground="orange")
+                return
+            
+            if edge_count == 0:
                 self.log("⚠️ 未发现任何信号连接，请检查配置!")
                 self.root.config(cursor="")
                 return
             
             # 生成Mermaid
             self.log("生成Mermaid图表...")
-            mmd_file, node_count, edge_count, signal_count = self.analyzer.generate_mermaid()
+            mmd_file, node_count, _, signal_count = self.analyzer.generate_mermaid()
             self.log(f"✅ Mermaid已生成: {mmd_file}")
             self.log(f"📊 组件: {node_count} | 连线: {edge_count} | 信号: {signal_count}")
             
@@ -894,7 +1117,6 @@ class RTEAnalyzerGUI:
                 f"📡 信号: {signal_count}\n\n"
                 f"结果文件已保存。")
             
-            # 自动保存配置
             ConfigManager.save_config(config)
             
         except Exception as e:
@@ -934,7 +1156,6 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = RTEAnalyzerGUI(root)
     
-    # 如果加载了配置且有src_root，自动填充
     if app.loaded_config and app.loaded_config.get('src_root'):
         app.log(f"📂 已加载配置，组件目录: {app.loaded_config.get('src_root')}")
     
