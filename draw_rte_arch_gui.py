@@ -19,16 +19,27 @@ class RTEAnalyzer:
         self.edge_signals = defaultdict(set)
         self.all_components = set()
         # 正则表达式
+        # 读宏: #define Rte_Read_模块_信号(data) (* (data) = Rte_全局信号变量, ((Std_ReturnType)RTE_E_OK))
+        # 左侧: 模块名和信号名（用于标识当前模块）
+        # 右侧: Rte_XXX_YYY 是真正的全局信号变量
         self.pat_read = re.compile(
-            r'#\s*define\s+Rte_Read_([a-zA-Z0-9]+)_([a-zA-Z0-9_]+)\(data\)\s*\(\s*\*\(data\)\s*=\s*Rte_([a-zA-Z0-9]+)_([a-zA-Z0-9_]+)\s*,\s*\(\(Std_ReturnType\)RTE_E_OK\)\s*\)'
+            r'#\s*define\s+Rte_Read_([a-zA-Z0-9_]+)_([a-zA-Z0-9_]+)\(data\)\s*\(\s*\*\(data\)\s*=\s*(Rte_[a-zA-Z0-9_]+_[a-zA-Z0-9_]+)\s*,\s*\(\(Std_ReturnType\)RTE_E_OK\)\s*\)'
         )
+        # 写宏: #define Rte_Write_模块_信号(data) (Rte_全局信号变量 = (data), ((Std_ReturnType)RTE_E_OK))
+        # 左侧: 模块名和信号名（用于标识当前模块）
+        # 右侧: Rte_XXX_YYY 是真正的全局信号变量
         self.pat_write = re.compile(
-            r'#\s*define\s+Rte_Write_[a-zA-Z0-9]+_[a-zA-Z0-9_]+\(data\)\s*\(\s*Rte_([a-zA-Z0-9]+)_([a-zA-Z0-9_]+)\s*=\s*\(data\)\s*,\s*\(\(Std_ReturnType\)RTE_E_OK\)\s*\)'
+            r'#\s*define\s+Rte_Write_([a-zA-Z0-9_]+)_([a-zA-Z0-9_]+)\(data\)\s*\(\s*(Rte_[a-zA-Z0-9_]+_[a-zA-Z0-9_]+)\s*=\s*\(data\)\s*,\s*\(\(Std_ReturnType\)RTE_E_OK\)\s*\)'
         )
         # 数据结构
-        self.write_map = defaultdict(set)
+        # 信号变量 (Rte_XXX_YYY) -> 显示用的信号名 (XXX_YYY)
+        self.signal_display_name = {}
+        # 信号变量 -> 写入该信号的模块集合（使用左侧的模块名）
         self.signal_to_writers = defaultdict(set)
+        # 信号变量 -> 读取该信号的模块集合（使用左侧的模块名）
         self.signal_to_readers = defaultdict(set)
+        # 模块 -> 写入的信号变量集合
+        self.write_map = defaultdict(set)
 
     def is_file_need_skip(self, filename: str) -> bool:
         if filename.startswith("Rte_") and filename.endswith(".h"):
@@ -58,17 +69,28 @@ class RTEAnalyzer:
                     # 匹配 Rte_Read
                     m = self.pat_read.search(line)
                     if m:
-                        recv_comp, sig, send_comp, sig2 = m.groups()
-                        if sig != sig2:
-                            continue
-                        self.signal_to_readers[sig].add(current_mod)
+                        # 左侧: 模块名, 信号名; 右侧: 全局信号变量 (Rte_XXX_YYY)
+                        left_mod, left_sig, signal_var = m.groups()
+                        # signal_var 是完整的全局信号变量，如 Rte_ASS_sSyncState_xdu8
+                        # 记录显示名称: 去掉 Rte_ 前缀
+                        if signal_var not in self.signal_display_name:
+                            self.signal_display_name[signal_var] = signal_var[4:]  # 去掉 "Rte_"
+                        # 当前模块读取了这个信号
+                        self.signal_to_readers[signal_var].add(current_mod)
                         continue
+                    
                     # 匹配 Rte_Write
                     mw = self.pat_write.search(line)
                     if mw:
-                        mod, sig = mw.groups()
-                        self.signal_to_writers[sig].add(mod)
-                        self.write_map[mod].add(sig)
+                        # 左侧: 模块名, 信号名; 右侧: 全局信号变量 (Rte_XXX_YYY)
+                        left_mod, left_sig, signal_var = mw.groups()
+                        # signal_var 是完整的全局信号变量，如 Rte_ASS_sSyncState_xdu8
+                        # 记录显示名称: 去掉 Rte_ 前缀
+                        if signal_var not in self.signal_display_name:
+                            self.signal_display_name[signal_var] = signal_var[4:]  # 去掉 "Rte_"
+                        # 记录写入者
+                        self.signal_to_writers[signal_var].add(current_mod)
+                        self.write_map[current_mod].add(signal_var)
         except Exception as e:
             print(f"跳过异常文件 {filepath}: {e}")
 
@@ -79,6 +101,7 @@ class RTEAnalyzer:
         self.write_map.clear()
         self.signal_to_writers.clear()
         self.signal_to_readers.clear()
+        self.signal_display_name.clear()
 
         parse_cnt = skip_type = skip_alpha = 0
         total_files = 0
@@ -107,87 +130,78 @@ class RTEAnalyzer:
         return parse_cnt, skip_type, skip_alpha
 
     def build_edges(self):
-        """根据收集的信号关系构建最终边集（双向确认）"""
+        """根据收集的信号关系构建最终边集"""
         self.edge_signals.clear()
         self.all_components.clear()
         
         temp_edges = defaultdict(set)
         
-        # 情况1: 显示所有模块
+        # 如果 display_mode 为 "all"，显示所有模块
         if self.display_mode == "all":
-            for sig, writers in self.signal_to_writers.items():
-                readers = self.signal_to_readers.get(sig, set())
+            for signal_var, writers in self.signal_to_writers.items():
+                readers = self.signal_to_readers.get(signal_var, set())
                 for writer in writers:
                     for reader in readers:
                         if writer == reader:
                             continue
-                        temp_edges[(writer, reader)].add(sig)
-                        self.all_components.add(writer)
-                        self.all_components.add(reader)
-            
-            for sig, readers in self.signal_to_readers.items():
-                writers = self.signal_to_writers.get(sig, set())
-                for reader in readers:
-                    for writer in writers:
-                        if writer == reader:
-                            continue
-                        temp_edges[(writer, reader)].add(sig)
+                        display_name = self.signal_display_name.get(signal_var, signal_var)
+                        temp_edges[(writer, reader)].add(display_name)
                         self.all_components.add(writer)
                         self.all_components.add(reader)
         
-        # 情况2: 仅显示目标模块
+        # 仅显示目标模块
         elif self.display_mode == "only":
             if not self.target_modules:
                 # 如果没有目标模块，显示所有
-                for sig, writers in self.signal_to_writers.items():
-                    readers = self.signal_to_readers.get(sig, set())
+                for signal_var, writers in self.signal_to_writers.items():
+                    readers = self.signal_to_readers.get(signal_var, set())
                     for writer in writers:
                         for reader in readers:
                             if writer == reader:
                                 continue
-                            temp_edges[(writer, reader)].add(sig)
+                            display_name = self.signal_display_name.get(signal_var, signal_var)
+                            temp_edges[(writer, reader)].add(display_name)
                             self.all_components.add(writer)
                             self.all_components.add(reader)
             else:
-                # 只保留目标模块之间的边
                 target_set = set(self.target_modules)
-                for sig, writers in self.signal_to_writers.items():
-                    readers = self.signal_to_readers.get(sig, set())
+                for signal_var, writers in self.signal_to_writers.items():
+                    readers = self.signal_to_readers.get(signal_var, set())
                     for writer in writers:
                         for reader in readers:
                             if writer == reader:
                                 continue
-                            # 只有两端都在目标模块中才保留
                             if writer in target_set and reader in target_set:
-                                temp_edges[(writer, reader)].add(sig)
+                                display_name = self.signal_display_name.get(signal_var, signal_var)
+                                temp_edges[(writer, reader)].add(display_name)
                                 self.all_components.add(writer)
                                 self.all_components.add(reader)
         
-        # 情况3: 显示目标模块及关联模块（默认）
+        # 显示目标模块及关联模块（默认）
         else:  # "related"
             if not self.target_modules:
                 # 如果没有目标模块，显示所有
-                for sig, writers in self.signal_to_writers.items():
-                    readers = self.signal_to_readers.get(sig, set())
+                for signal_var, writers in self.signal_to_writers.items():
+                    readers = self.signal_to_readers.get(signal_var, set())
                     for writer in writers:
                         for reader in readers:
                             if writer == reader:
                                 continue
-                            temp_edges[(writer, reader)].add(sig)
+                            display_name = self.signal_display_name.get(signal_var, signal_var)
+                            temp_edges[(writer, reader)].add(display_name)
                             self.all_components.add(writer)
                             self.all_components.add(reader)
             else:
                 target_set = set(self.target_modules)
-                # 先收集所有与目标模块相关的边
-                for sig, writers in self.signal_to_writers.items():
-                    readers = self.signal_to_readers.get(sig, set())
+                for signal_var, writers in self.signal_to_writers.items():
+                    readers = self.signal_to_readers.get(signal_var, set())
                     for writer in writers:
                         for reader in readers:
                             if writer == reader:
                                 continue
-                            # 只要有一端在目标模块中就保留
                             if writer in target_set or reader in target_set:
-                                temp_edges[(writer, reader)].add(sig)
+                                display_name = self.signal_display_name.get(signal_var, signal_var)
+                                temp_edges[(writer, reader)].add(display_name)
                                 self.all_components.add(writer)
                                 self.all_components.add(reader)
         
@@ -734,39 +748,43 @@ class RTEAnalyzer:
         window.exportToPNG = function() {{
             const svgEl = document.querySelector('.mermaid svg');
             if (!svgEl) {{ alert('图表未加载'); return; }}
+            
+            // 不再重置高亮，保留当前高亮状态
             const hadSel = selectedNode !== null;
-            if (hadSel) resetHighlight();
-            setTimeout(() => {{
-                const clone = svgEl.cloneNode(true);
-                const bbox = svgEl.getBBox();
-                clone.setAttribute('width', bbox.width*2);
-                clone.setAttribute('height', bbox.height*2);
-                const canvas = document.createElement('canvas');
-                canvas.width = bbox.width*2;
-                canvas.height = bbox.height*2;
-                const ctx = canvas.getContext('2d');
-                ctx.fillStyle = 'white';
-                ctx.fillRect(0,0,canvas.width,canvas.height);
-                const img = new Image();
-                img.onload = () => {{
-                    ctx.drawImage(img,0,0,canvas.width,canvas.height);
-                    const a = document.createElement('a');
-                    a.download = 'rte_architecture.png';
-                    a.href = canvas.toDataURL('image/png');
-                    a.click();
-                    if (hadSel && selectedNode) highlightNode(selectedNode);
-                }};
-                const svgData = new XMLSerializer().serializeToString(clone);
-                img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svgData)));
-            }}, 200);
+            
+            // 克隆SVG并保留所有样式（包括高亮）
+            const clone = svgEl.cloneNode(true);
+            const bbox = svgEl.getBBox();
+            clone.setAttribute('width', bbox.width * 2);
+            clone.setAttribute('height', bbox.height * 2);
+            
+            const canvas = document.createElement('canvas');
+            canvas.width = bbox.width * 2;
+            canvas.height = bbox.height * 2;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = 'white';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            const img = new Image();
+            img.onload = () => {{
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                const a = document.createElement('a');
+                a.download = 'rte_architecture.png';
+                a.href = canvas.toDataURL('image/png');
+                a.click();
+                // 不重置高亮，保持当前状态
+            }};
+            const svgData = new XMLSerializer().serializeToString(clone);
+            img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svgData)));
         }};
 
         window.exportToSVG = function() {{
             const svgEl = document.querySelector('.mermaid svg');
             if (!svgEl) {{ alert('图表未加载'); return; }}
+            
+            // 克隆SVG并保留所有样式（包括高亮）
             const clone = svgEl.cloneNode(true);
-            const style = clone.getElementById('highlight-style');
-            if (style) style.remove();
+            // 不删除高亮样式，保留所有样式信息
             const svgData = new XMLSerializer().serializeToString(clone);
             const blob = new Blob([svgData], {{type: 'image/svg+xml'}});
             const url = URL.createObjectURL(blob);
@@ -919,7 +937,7 @@ class RTEAnalyzerGUI:
         ttk.Checkbutton(checkbox_frame, text="合并多信号", variable=self.merge_var).pack(side=tk.LEFT, padx=(0, 15))
         
         self.alphabet_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(checkbox_frame, text="仅分析纯字母模块的文件", variable=self.alphabet_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(checkbox_frame, text="仅分析字母模块名", variable=self.alphabet_var).pack(side=tk.LEFT)
         
         status_frame = ttk.LabelFrame(main_frame, text="📊 状态", padding="10")
         status_frame.pack(fill=tk.X, pady=(0, 10))
